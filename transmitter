@@ -1,1 +1,467 @@
-#transmitter
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#define BTN1  4
+#define BTN2  5
+#define BTN3 18
+#define BTN4 19
+
+#define BUZZER_PIN 23
+
+uint8_t receiverMAC[]    = {0xB0, 0xCB, 0xD8, 0x02, 0xA8, 0x8C};
+uint8_t transmitterMAC[] = {0xB0, 0xCB, 0xD8, 0xCF, 0x4C, 0x1C};
+
+typedef struct {
+  uint8_t type;
+  uint8_t player;
+  uint8_t dice;
+  uint8_t token;
+  uint8_t playerList[4];
+} GameData;
+
+typedef struct {
+  uint8_t type;
+  uint8_t currentPlayer;
+  uint8_t lastDice;
+  uint8_t lastToken;
+  uint8_t event;
+} StateMsg;
+
+GameData outgoing;
+StateMsg incomingState;
+
+bool    joined[5]       = {false};
+uint8_t playerOrder[4];
+int     totalPlayers    = 0;
+bool    gameStarted     = false;
+bool    joinLocked      = false;
+
+uint8_t currentPlayer   = 0;
+int     lastDice        = 0;
+bool    waitingForDice  = false;
+bool    waitingForToken = false;
+
+unsigned long displayUntil   = 0;
+char          pendingLine1[24] = "";
+char          pendingLine2[24] = "";
+bool          pendingDisplay   = false;
+
+volatile bool newStateFlag = false;
+StateMsg      stateBuffer;
+StateMsg      pendingStateMsg;
+
+// ─────────────────────────────────────────────
+//  BUZZER HELPER
+// ─────────────────────────────────────────────
+
+void buzz(int freq, int dur) {
+  tone(BUZZER_PIN, freq, dur);
+  delay(dur + 10);
+}
+
+void noSound() {
+  noTone(BUZZER_PIN);
+}
+
+// ─────────────────────────────────────────────
+//  SOUND EFFECTS
+// ─────────────────────────────────────────────
+
+// Dice roll → Fast rattle (rapid random beeps, non-blocking via millis in rollDiceAnimation)
+// Called inside rollDiceAnimation so it is timed with the animation frames; 
+// a single rattle tick is used per animation frame.
+void buzzDiceRattle() {
+  int freqs[] = {400, 520, 380, 600, 450, 350, 500, 420};
+  tone(BUZZER_PIN, freqs[random(0, 8)], 50);
+  // no delay here — the animation loop provides the frame delay
+}
+
+// Rolled a 6 / Roll again → Rising jingle  (C5 E5 G5)
+void buzzRolled6() {
+  buzz(523, 100);
+  buzz(659, 100);
+  buzz(784, 200);
+}
+
+// Token moves → Single tick
+void buzzTokenMove() {
+  buzz(800, 50);
+}
+
+// Token out of base → Slide up (glide 300→800 Hz)
+void buzzTokenOut() {
+  for (int f = 300; f <= 800; f += 25) {
+    tone(BUZZER_PIN, f, 18);
+    delay(18);
+  }
+  noSound();
+}
+
+// Kill opponent → Explosion buzz (descending rumble 200→50 Hz)
+void buzzKill() {
+  for (int f = 200; f >= 50; f -= 10) {
+    tone(BUZZER_PIN, f, 20);
+    delay(20);
+  }
+  noSound();
+}
+
+// Token reaches home → Classic ta-da  (G4 C5 E5 G5 C6)
+void buzzTokenHome() {
+  buzz(392,  80);
+  buzz(523,  80);
+  buzz(659,  80);
+  buzz(784,  80);
+  buzz(1047, 250);
+}
+
+// No moves / skip → Error beep (single low tone)
+void buzzNoMoves() {
+  buzz(150, 300);
+}
+
+// Triple 6 – turn lost → Low alarm (two-burst low buzz)
+void buzzTriple6() {
+  buzz(300, 100);
+  delay(40);
+  buzz(300, 100);
+  delay(40);
+  buzz(200, 250);
+}
+
+// Win game → Full fanfare  (C5 C5 C5 E5 C5 E5 G5)
+void buzzWin() {
+  buzz(523, 100);
+  buzz(523, 100);
+  buzz(523, 100);
+  buzz(659, 100);
+  buzz(523, 100);
+  buzz(659, 100);
+  buzz(784, 400);
+}
+
+// Game start → 3-2-1 beeps  (three equal beeps then a high confirm)
+void buzzGameStart() {
+  buzz(440,  80); delay(80);
+  buzz(440,  80); delay(80);
+  buzz(440,  80); delay(80);
+  buzz(880, 250);
+}
+
+// Button join click → subtle confirm blip
+void buzzJoinClick() {
+  buzz(600, 60);
+}
+
+// ─────────────────────────────────────────────
+//  ESP-NOW / DATA
+// ─────────────────────────────────────────────
+
+void sendData(uint8_t type, uint8_t player, uint8_t dice, uint8_t token,
+              uint8_t p0=0, uint8_t p1=0, uint8_t p2=0, uint8_t p3=0) {
+  outgoing.type = type; outgoing.player = player;
+  outgoing.dice = dice; outgoing.token  = token;
+  outgoing.playerList[0] = p0; outgoing.playerList[1] = p1;
+  outgoing.playerList[2] = p2; outgoing.playerList[3] = p3;
+  esp_now_send(receiverMAC, (uint8_t*)&outgoing, sizeof(outgoing));
+}
+
+// ─────────────────────────────────────────────
+//  OLED HELPERS
+// ─────────────────────────────────────────────
+
+void oledClear() { display.clearDisplay(); display.setTextColor(WHITE); }
+
+void oledShow(const char* line1, const char* line2 = "", int size1 = 2, int size2 = 2) {
+  oledClear();
+  display.setTextSize(size1); display.setCursor(0, 8); display.println(line1);
+  if (strlen(line2) > 0) { display.setTextSize(size2); display.setCursor(0, 38); display.println(line2); }
+  display.display();
+}
+
+void oledShowTimed(const char* line1, const char* line2, unsigned long ms, const char* nl1, const char* nl2) {
+  oledShow(line1, line2);
+  displayUntil = millis() + ms;
+  strncpy(pendingLine1, nl1, 23);
+  strncpy(pendingLine2, nl2, 23);
+  pendingDisplay = true;
+}
+
+const char* playerColorName(uint8_t player) {
+  switch (player) {
+    case 1: return "Green";
+    case 2: return "Yellow";
+    case 3: return "Red";
+    case 4: return "Blue";
+  }
+  return "";
+}
+
+void oledShowPlayer(uint8_t player, const char* prompt) {
+  char line1[20]; sprintf(line1, "P%d %s", player, playerColorName(player));
+  oledShow(line1, prompt, 2, 2);
+}
+
+void oledShowJoinScreen() {
+  oledClear();
+  display.setTextSize(1); display.setCursor(0, 0); display.println("Players joined:");
+  display.setTextSize(2); display.setCursor(0, 18);
+  char line[20] = "";
+  for (int i = 0; i < totalPlayers; i++) { char buf[4]; sprintf(buf, "P%d ", playerOrder[i]); strcat(line, buf); }
+  display.println(line);
+  display.setTextSize(1); display.setCursor(0, 50); display.println("Press joined btn to start");
+  display.display();
+}
+
+void oledShowDice(int num) {
+  oledClear();
+  int cx = 40, cy = 32, r = 5;
+  if (num == 1 || num == 3 || num == 5) display.fillCircle(cx, cy, r, WHITE);
+  if (num >= 2) { display.fillCircle(cx-14, cy-12, r, WHITE); display.fillCircle(cx+14, cy+12, r, WHITE); }
+  if (num >= 4) { display.fillCircle(cx+14, cy-12, r, WHITE); display.fillCircle(cx-14, cy+12, r, WHITE); }
+  if (num == 6) { display.fillCircle(cx-14, cy, r, WHITE);    display.fillCircle(cx+14, cy, r, WHITE); }
+  display.setTextSize(4); display.setCursor(88, 16); display.print(num); display.display();
+}
+
+// ─────────────────────────────────────────────
+//  DICE ANIMATION (with rattle sound per frame)
+// ─────────────────────────────────────────────
+
+int rollDiceAnimation() {
+  int delayTime = 50;
+  for (int i = 0; i < 14; i++) {
+    oledShowDice(random(1, 7));
+    buzzDiceRattle();          // one rattle tick per animation frame
+    delay(delayTime);
+    delayTime += 12;
+  }
+  noSound();
+  int result = random(1, 7);
+  oledShowDice(result);
+  delay(600);
+  return result;
+}
+
+// ─────────────────────────────────────────────
+//  INPUT
+// ─────────────────────────────────────────────
+
+int getPressedButton() {
+  if (digitalRead(BTN1) == LOW) return 1;
+  if (digitalRead(BTN2) == LOW) return 2;
+  if (digitalRead(BTN3) == LOW) return 3;
+  if (digitalRead(BTN4) == LOW) return 4;
+  return 0;
+}
+
+void waitButtonRelease() { while (getPressedButton() != 0); delay(80); }
+
+// ─────────────────────────────────────────────
+//  GAME RESET
+// ─────────────────────────────────────────────
+
+void resetGame() {
+  for (int i = 0; i < 5; i++) joined[i] = false;
+  totalPlayers = 0; gameStarted = false; joinLocked = false;
+  currentPlayer = 0; lastDice = 0; waitingForDice = false;
+  waitingForToken = false; pendingDisplay = false;
+  memset(playerOrder, 0, sizeof(playerOrder));
+}
+
+// ─────────────────────────────────────────────
+//  JOIN HANDLING
+// ─────────────────────────────────────────────
+
+void handleJoinPress(int btn) {
+  if (joined[btn]) {
+    if (totalPlayers < 2) { oledShow("Need 2+", "players!"); delay(1200); oledShowJoinScreen(); return; }
+    joinLocked = true; gameStarted = true;
+    sendData(2, 0, totalPlayers, 0,
+      totalPlayers > 0 ? playerOrder[0] : 0,
+      totalPlayers > 1 ? playerOrder[1] : 0,
+      totalPlayers > 2 ? playerOrder[2] : 0,
+      totalPlayers > 3 ? playerOrder[3] : 0);
+    Serial.print("INIT sent. Order: ");
+    for (int i = 0; i < totalPlayers; i++) Serial.printf("%d ", playerOrder[i]);
+    Serial.println();
+    buzzGameStart();           // 3-2-1 beeps on game start
+    oledShow("Game", "Starting!");
+    return;
+  }
+  if (totalPlayers >= 4) return;
+  joined[btn] = true;
+  playerOrder[totalPlayers++] = btn;
+  buzzJoinClick();             // subtle blip when a player joins
+  Serial.printf("Player %d joined\n", btn);
+  oledShowJoinScreen();
+}
+
+// ─────────────────────────────────────────────
+//  ESP-NOW CALLBACKS
+// ─────────────────────────────────────────────
+
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "TX OK" : "TX FAIL");
+}
+
+void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  memcpy(&stateBuffer, data, sizeof(stateBuffer));
+  newStateFlag = true;
+}
+
+// ─────────────────────────────────────────────
+//  STATE PROCESSING
+// ─────────────────────────────────────────────
+
+void processState(StateMsg &s) {
+  currentPlayer = s.currentPlayer;
+  lastDice      = s.lastDice;
+  Serial.printf("State recv -> P%d dice:%d token:%d event:%d\n",
+                s.currentPlayer, s.lastDice, s.lastToken, s.event);
+
+  char nl1[24], nl2[24];
+  sprintf(nl1, "P%d %s", currentPlayer, playerColorName(currentPlayer));
+
+  switch (s.event) {
+    case 0:  // normal turn start
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Dice");
+      if (s.lastToken > 0) {
+        buzzTokenMove();
+        char buf[24]; sprintf(buf, "T%d moved", s.lastToken);
+        oledShowTimed(buf, "", 900, nl1, nl2);
+      } else oledShow(nl1, nl2);
+      break;
+
+    case 1:  // kill event
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Dice");
+      buzzKill();
+      { char buf[24]; sprintf(buf, "T%d KILL!", s.lastToken);
+        oledShowTimed(buf, "", 1000, nl1, nl2); }
+      break;
+
+    case 2:  // no moves / skip
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Dice");
+      buzzNoMoves();
+      oledShowTimed("No moves!", "Skipping...", 1000, nl1, nl2);
+      break;
+
+    case 3:  // triple 6 – turn lost
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Dice");
+      buzzTriple6();
+      oledShowTimed("Triple 6!", "Turn lost", 1200, nl1, nl2);
+      break;
+
+    case 4:  // token exits base (roll again)
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Again!");
+      buzzTokenOut();
+      { char buf[24]; sprintf(buf, "T%d is out!", s.lastToken);
+        oledShowTimed(buf, "Roll Again!", 1000, nl1, nl2); }
+      break;
+
+    case 5:  // token reaches home (roll again)
+      waitingForDice = true; waitingForToken = false; strcpy(nl2, "Roll Again!");
+      buzzTokenHome();
+      { char buf[24]; sprintf(buf, "T%d Home!", s.lastToken);
+        oledShowTimed(buf, "Roll Again!", 1200, nl1, nl2); }
+      break;
+
+    case 6:  // win
+      { char l1[20], l2[16];
+        sprintf(l1, "P%d %s", s.currentPlayer, playerColorName(s.currentPlayer));
+        sprintf(l2, "WINS! GG!");
+        oledShow(l1, l2); }
+      buzzWin();
+      waitingForDice = false; waitingForToken = false;
+      delay(3000); resetGame(); oledShow("LUDO", "Press Join");
+      break;
+
+    case 7:  // choose token
+      waitingForDice = false; waitingForToken = true;
+      { char l1[16]; sprintf(l1, "Dice: %d", lastDice);
+        oledShow(l1, "Pick Token"); }
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  GAME PRESS HANDLER
+// ─────────────────────────────────────────────
+
+void handleGamePress(int btn) {
+  if (waitingForDice) {
+    if (btn != currentPlayer) return;
+    waitingForDice = false;
+    oledShowPlayer(currentPlayer, "Rolling...");
+    int dice = rollDiceAnimation();
+    lastDice = dice;
+    if (dice == 6) buzzRolled6();   // extra jingle after a 6
+    sendData(0, currentPlayer, dice, 0);
+  } else if (waitingForToken) {
+    char buf[20]; sprintf(buf, "Token %d", btn);
+    oledShow("Chose", buf);
+    sendData(1, currentPlayer, lastDice, btn);
+    waitingForToken = false;
+  }
+}
+
+// ─────────────────────────────────────────────
+//  SETUP & LOOP
+// ─────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN1, INPUT_PULLUP); pinMode(BTN2, INPUT_PULLUP);
+  pinMode(BTN3, INPUT_PULLUP); pinMode(BTN4, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  Wire.begin(21, 22);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed"); while (true);
+  }
+  display.clearDisplay(); display.setTextColor(WHITE); display.display();
+  delay(300);
+
+  randomSeed(esp_random());
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); WiFi.setChannel(1);
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); return; }
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onDataRecv);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, receiverMAC, 6);
+  peer.channel = 1; peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  // boot confirmation beep
+  buzz(440, 80); buzz(880, 150);
+
+  oledShow("LUDO", "Press Join");
+  Serial.println("Transmitter ready");
+  Serial.print("MAC: "); Serial.println(WiFi.macAddress());
+}
+
+void loop() {
+  if (pendingDisplay && millis() >= displayUntil) {
+    pendingDisplay = false;
+    oledShow(pendingLine1, pendingLine2);
+  }
+
+  if (newStateFlag) {
+    newStateFlag = false;
+    memcpy(&pendingStateMsg, &stateBuffer, sizeof(stateBuffer));
+    if (gameStarted) processState(pendingStateMsg);
+  }
+
+  int btn = getPressedButton();
+  if (btn == 0) return;
+  waitButtonRelease();
+
+  if (!joinLocked)        handleJoinPress(btn);
+  else if (gameStarted)   handleGamePress(btn);
+}
