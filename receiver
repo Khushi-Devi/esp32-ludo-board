@@ -1,1 +1,724 @@
-#receiver
+#include <esp_now.h>
+#include <WiFi.h>
+#define NEOPIXEL_ESP32_RMT
+#include <Adafruit_NeoPixel.h>
+
+#define MAIN_PIN    15
+#define BASE1_PIN   19
+#define BASE2_PIN    4
+#define BASE3_PIN   21
+#define BASE4_PIN   18
+#define MAIN_LEDS   88
+#define BASE_LEDS    4
+#define COLOR_ORDER (NEO_GRB + NEO_KHZ800)
+
+Adafruit_NeoPixel mainStrip(MAIN_LEDS, MAIN_PIN, COLOR_ORDER);
+Adafruit_NeoPixel base1(BASE_LEDS, BASE1_PIN, COLOR_ORDER);
+Adafruit_NeoPixel base2(BASE_LEDS, BASE2_PIN, COLOR_ORDER);
+Adafruit_NeoPixel base3(BASE_LEDS, BASE3_PIN, COLOR_ORDER);
+Adafruit_NeoPixel base4(BASE_LEDS, BASE4_PIN, COLOR_ORDER);
+
+// ─────────────────────────────────────────
+//  BOARD CONSTANTS
+// ─────────────────────────────────────────
+const int SAFE_SPOTS[] = {1, 9, 19, 27, 37, 45, 55, 63};
+const int ENTRY_POINT[]     = {0, 1, 19, 37, 55};
+const int HOME_PATH_START[] = {0, 67, 13, 31, 49};
+
+const int MAIN_TRACK[] = {
+   0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,
+  18,19,20,21,22,23,24,25,26,27,28,29,30,
+  36,37,38,39,40,41,42,43,44,45,46,47,48,
+  54,55,56,57,58,59,60,61,62,63,64,65,66
+};
+const int MAIN_TRACK_LEN = 52;
+
+// ─────────────────────────────────────────
+//  POSITION SYSTEM
+//
+//  pos == -2      → not in game
+//  pos == -1      → sitting in base
+//  pos   0 - 50   → main track (51 squares, 0=entry, 50=last before home)
+//  pos  51 - 55   → home lane  (51=step1 … 55=step5=finished)
+//
+//  Every token travels exactly 51 main-track squares then
+//  up to 5 home-lane squares to finish.
+// ─────────────────────────────────────────
+
+uint32_t colorGreen[4];
+uint32_t colorYellow[4];
+uint32_t colorBlue[4];
+uint32_t colorRed[4];
+
+typedef struct {
+  uint8_t type;
+  uint8_t player;
+  uint8_t dice;
+  uint8_t token;
+  uint8_t playerList[4];
+} GameData;
+
+typedef struct {
+  uint8_t type;
+  uint8_t currentPlayer;
+  uint8_t lastDice;
+  uint8_t lastToken;
+  uint8_t event;
+} StateMsg;
+
+GameData incomingData;
+StateMsg outgoingState;
+uint8_t transmitterMAC[] = {0xB0, 0xCB, 0xD8, 0xCF, 0x4C, 0x1C};
+
+struct Token {
+  uint8_t player;
+  uint8_t id;
+  int     pos;
+  bool    onHome;
+  bool    finished;
+};
+
+Token tokens[16];
+
+uint8_t playerOrder[4];
+int     totalPlayers       = 0;
+int     currentPlayerIndex = 0;
+uint8_t currentPlayer      = 0;
+int     diceValue          = 0;
+int     sixCount           = 0;
+bool    gameStarted        = false;
+bool    waitingForToken    = false;
+bool    killHappened       = false;
+bool    tokenJustEntered   = false;
+
+unsigned long lastFlickerTime[4] = {0, 0, 0, 0};
+bool          flickerState[4]    = {true, true, true, true};
+const unsigned long FLICKER_PERIOD[] = {0, 600, 300, 150};
+
+bool          pendingState  = false;
+uint8_t       pendingEvent  = 0;
+unsigned long pendingSendAt = 0;
+#define SEND_DELAY_MS 50
+
+// ─────────────────────────────────────────
+//  entryStep: MAIN_TRACK index (0-51) for player's entry LED
+// ─────────────────────────────────────────
+int entryStep(int player) {
+  int ep = ENTRY_POINT[player];
+  for (int i = 0; i < MAIN_TRACK_LEN; i++)
+    if (MAIN_TRACK[i] == ep) return i;
+  return 0;
+}
+
+// ─────────────────────────────────────────
+//  posToLED: relative pos (0-50) → actual LED index
+//  returns -1 when pos is out of main-track range
+// ─────────────────────────────────────────
+int posToLED(int player, int pos) {
+  if (pos < 0 || pos > 50) return -1;
+  return MAIN_TRACK[(entryStep(player) + pos) % MAIN_TRACK_LEN];
+}
+
+int baseLED(int player, int tokenID) {
+  return 200 + ((player - 1) * 4) + tokenID;
+}
+
+void setLED(int index, uint32_t color) {
+  if      (index >= 0   && index <= 87)  mainStrip.setPixelColor(index, color);
+  else if (index >= 200 && index <= 203) base1.setPixelColor(index - 200, color);
+  else if (index >= 204 && index <= 207) base2.setPixelColor(index - 204, color);
+  else if (index >= 208 && index <= 211) base3.setPixelColor(index - 208, color);
+  else if (index >= 212 && index <= 215) base4.setPixelColor(index - 212, color);
+}
+
+void clearAll() {
+  mainStrip.clear();
+  base1.clear(); base2.clear(); base3.clear(); base4.clear();
+}
+
+void showAll() {
+  mainStrip.show();
+  base1.show(); base2.show(); base3.show(); base4.show();
+}
+
+void queueState(uint8_t event) {
+  pendingState  = true;
+  pendingEvent  = event;
+  pendingSendAt = millis() + SEND_DELAY_MS;
+}
+
+uint32_t getColor(int player, int tokenID) {
+  if (player < 1 || player > 4) return 0;
+  if (tokenID < 0 || tokenID > 3) tokenID = 0;
+  switch (player) {
+    case 1: return colorGreen[tokenID];
+    case 2: return colorYellow[tokenID];
+    case 3: return colorRed[tokenID];
+    case 4: return colorBlue[tokenID];
+  }
+  return 0;
+}
+
+uint32_t fadeColor(uint32_t c, float f) {
+  return mainStrip.Color(
+    ((c >> 16) & 0xFF) * f,
+    ((c >>  8) & 0xFF) * f,
+    ((c      ) & 0xFF) * f
+  );
+}
+
+uint32_t getTokenColor(Token &t) {
+  uint32_t col = getColor(t.player, t.id);
+  if (!waitingForToken || t.player != currentPlayer) return col;
+  if (t.id == 0) return col;
+  return flickerState[t.id] ? col : 0;
+}
+
+void drawBoard();
+
+void updateFlicker() {
+  if (!waitingForToken) return;
+  unsigned long now = millis();
+  bool changed = false;
+  for (int id = 1; id <= 3; id++) {
+    if (now - lastFlickerTime[id] >= FLICKER_PERIOD[id]) {
+      lastFlickerTime[id] = now;
+      flickerState[id]    = !flickerState[id];
+      changed = true;
+    }
+  }
+  if (changed) drawBoard();
+}
+
+// ─────────────────────────────────────────
+//  tokenToLED
+// ─────────────────────────────────────────
+int tokenToLED(Token &t) {
+  if (t.pos == -1) return baseLED(t.player, t.id);
+  if (t.onHome)    return HOME_PATH_START[t.player] + (t.pos - 51);
+  return posToLED(t.player, t.pos);
+}
+
+bool isSafe(int ledIndex) {
+  for (int i = 0; i < 8; i++)
+    if (SAFE_SPOTS[i] == ledIndex) return true;
+  return false;
+}
+
+bool isActivePlayer(int player) {
+  for (int p = 0; p < totalPlayers; p++)
+    if (playerOrder[p] == player) return true;
+  return false;
+}
+
+int getTokenIndex(int player, int tokenID) {
+  return (player - 1) * 4 + (tokenID - 1);
+}
+
+// ─────────────────────────────────────────
+//  canMove
+//
+//  Main track:  51 squares (pos 0-50)
+//               sth = steps to home entry = 51 - pos
+//               (at pos=50, sth=1 → dice=1 enters home at step 1)
+//
+//  Home lane:   5 steps (pos 51-55)
+//               stepsInHome = pos - 51  (0 at first home LED)
+//               stepsLeft   = 5 - stepsInHome
+//               can move if diceValue <= stepsLeft
+//
+//  Home entry:  diceValue can overshoot up to 5 home steps
+// ─────────────────────────────────────────
+bool canMove(Token &t) {
+  if (t.finished || t.pos == -2) return false;
+  if (t.pos == -1) return (diceValue == 6);
+
+  if (t.onHome) {
+    int stepsInHome = t.pos - 51;        // 0 = first home LED
+    int stepsLeft   = 4 - stepsInHome;   // steps remaining to finish
+    return (diceValue <= stepsLeft);
+  }
+
+  int sth = 51 - t.pos;                  // steps to reach home entry
+  if (diceValue >= sth)
+    return ((diceValue - sth) <= 4);     // can enter home if not overshooting
+  return true;
+}
+
+bool anyCanMove(int player) {
+  for (int i = 0; i < 16; i++)
+    if (tokens[i].player == player && canMove(tokens[i])) return true;
+  return false;
+}
+
+int getCrossPlayerStack(int ledIndex, int players[4], int ids[4]) {
+  int count = 0;
+  for (int i = 0; i < 16; i++) {
+    if (tokens[i].finished || tokens[i].pos < 0 || tokens[i].onHome) continue;
+    if (tokenToLED(tokens[i]) != ledIndex) continue;
+    bool found = false;
+    for (int j = 0; j < count; j++)
+      if (players[j] == tokens[i].player) { found = true; break; }
+    if (!found && count < 4) { players[count] = tokens[i].player; ids[count] = tokens[i].id; count++; }
+  }
+  return count;
+}
+
+// ─────────────────────────────────────────
+//  DRAW BOARD
+// ─────────────────────────────────────────
+void drawBoard() {
+  clearAll();
+  bool drawn[88] = {false};
+
+  for (int i = 0; i < 16; i++) {
+    Token &t = tokens[i];
+    if (t.pos == -2 || t.finished) continue;
+
+    if (t.pos == -1) {
+      if (isActivePlayer(t.player))
+        setLED(baseLED(t.player, t.id), getColor(t.player, t.id));
+      continue;
+    }
+
+    if (t.onHome) {
+      int led = HOME_PATH_START[t.player] + (t.pos - 51);
+      if (led >= 0 && led < MAIN_LEDS) setLED(led, getTokenColor(t));
+      continue;
+    }
+
+    int led = tokenToLED(t);
+    if (led < 0 || led >= MAIN_LEDS || drawn[led]) continue;
+    drawn[led] = true;
+
+    if (isSafe(led)) {
+      int cp[4], ci[4];
+      if (getCrossPlayerStack(led, cp, ci) > 1) {
+        setLED(led, getColor(cp[(millis() / 400) % 2], ci[(millis() / 400) % 2]));
+        continue;
+      }
+    }
+
+    int brightID = t.id;
+    Token *bt = &t;
+    for (int j = 0; j < 16; j++) {
+      if (tokens[j].player != t.player || tokens[j].finished || tokens[j].pos < 0 || tokens[j].onHome) continue;
+      if (tokenToLED(tokens[j]) == led && tokens[j].id > brightID) {
+        brightID = tokens[j].id; bt = &tokens[j];
+      }
+    }
+    setLED(led, getTokenColor(*bt));
+  }
+  showAll();
+}
+
+// ─────────────────────────────────────────
+//  ANIM 1: Game Start
+// ─────────────────────────────────────────
+void gameStartAnimation() {
+  for (int step = 0; step < MAIN_TRACK_LEN; step++) {
+    clearAll();
+    for (int tail = 0; tail <= 4; tail++) {
+      int idx = step - tail; if (idx < 0) idx += MAIN_TRACK_LEN;
+      uint8_t b = 200 * (1.0f - tail * 0.2f);
+      mainStrip.setPixelColor(MAIN_TRACK[idx], mainStrip.Color(b, b, b));
+    }
+    showAll(); delay(35);
+  }
+  clearAll(); showAll(); delay(100);
+  for (int pulse = 0; pulse < 3; pulse++) {
+    for (int p = 0; p < totalPlayers; p++)
+      for (int t = 0; t < 4; t++)
+        setLED(baseLED(playerOrder[p], t), getColor(playerOrder[p], t));
+    showAll(); delay(300);
+    clearAll(); showAll(); delay(150);
+  }
+  drawBoard();
+}
+
+// ─────────────────────────────────────────
+//  ANIM 2: Kill
+// ─────────────────────────────────────────
+void killAnimation(Token &victim) {
+  uint32_t col      = getColor(victim.player, victim.id);
+  int      deathLED = tokenToLED(victim);
+
+  for (int f = 0; f < 3; f++) {
+    setLED(deathLED, mainStrip.Color(255, 0, 0)); showAll(); delay(120);
+    setLED(deathLED, col);                         showAll(); delay(120);
+  }
+  for (float fac = 1.0f; fac >= 0; fac -= 0.15f) {
+    setLED(deathLED, fadeColor(col, fac)); showAll(); delay(30);
+  }
+  setLED(deathLED, 0); showAll(); delay(80);
+
+  for (int s = victim.pos; s > 0; s--) {
+    int currLED = posToLED(victim.player, s);
+    int nextLED = posToLED(victim.player, s - 1);
+    setLED(nextLED, col);
+    bool occupied = false;
+    for (int i = 0; i < 16; i++) {
+      if (tokens[i].finished || tokens[i].pos < 0 || tokens[i].onHome) continue;
+      if (tokens[i].player != victim.player && tokenToLED(tokens[i]) == currLED) { occupied = true; break; }
+    }
+    if (!occupied) setLED(currLED, 0);
+    showAll(); delay(80);
+  }
+  setLED(posToLED(victim.player, 0), 0); showAll(); delay(80);
+
+  int bLED = baseLED(victim.player, victim.id);
+  for (int f = 0; f < 3; f++) {
+    setLED(bLED, col); showAll(); delay(150);
+    setLED(bLED, 0);   showAll(); delay(100);
+  }
+}
+
+bool checkKill(int movedIndex) {
+  Token &t = tokens[movedIndex];
+  if (t.onHome || t.pos < 0) return false;
+  int led = tokenToLED(t);
+  if (isSafe(led)) return false;
+
+  int victimIndex = -1, lowestID = 99;
+  for (int i = 0; i < 16; i++) {
+    if (i == movedIndex || tokens[i].player == t.player) continue;
+    if (tokens[i].pos < 0 || tokens[i].onHome || tokens[i].finished) continue;
+    if (tokenToLED(tokens[i]) != led) continue;
+    if (tokens[i].id < lowestID) { lowestID = tokens[i].id; victimIndex = i; }
+  }
+  if (victimIndex == -1) return false;
+
+  killAnimation(tokens[victimIndex]);
+  tokens[victimIndex].pos    = -1;
+  tokens[victimIndex].onHome = false;
+  killHappened = true;
+  Serial.printf("KILL: P%d T%d back to base\n", tokens[victimIndex].player, tokens[victimIndex].id);
+  return true;
+}
+
+// ─────────────────────────────────────────
+//  ANIM 3: Home complete
+// ─────────────────────────────────────────
+void homeCompleteAnimation(int player) {
+  uint32_t col = getColor(player, 3);
+  for (int pulse = 0; pulse < 3; pulse++) {
+    for (int t = 0; t < 4; t++) setLED(baseLED(player, t), col);
+    showAll(); delay(300);
+    for (int t = 0; t < 4; t++) setLED(baseLED(player, t), 0);
+    showAll(); delay(150);
+  }
+}
+
+// ─────────────────────────────────────────
+//  ANIM 4: Win
+// ─────────────────────────────────────────
+void winAnimation(int player) {
+  uint32_t col = getColor(player, 3);
+  for (int blink = 0; blink < 5; blink++) {
+    clearAll();
+    for (int i = 0; i < MAIN_TRACK_LEN; i++) mainStrip.setPixelColor(MAIN_TRACK[i], col);
+    for (int t = 0; t < 4; t++) setLED(baseLED(player, t), col);
+    showAll(); delay(400);
+    clearAll(); showAll(); delay(200);
+  }
+  for (int step = 0; step < MAIN_TRACK_LEN; step++) {
+    clearAll();
+    for (int tail = 0; tail <= 5; tail++) {
+      int idx = step - tail; if (idx < 0) idx += MAIN_TRACK_LEN;
+      setLED(MAIN_TRACK[idx], fadeColor(col, 1.0f - tail * 0.17f));
+    }
+    showAll(); delay(25);
+  }
+  clearAll(); showAll();
+}
+
+void initTokens() {
+  for (int i = 0; i < 16; i++) {
+    tokens[i].player = 0; tokens[i].id = 0; tokens[i].pos = -2;
+    tokens[i].onHome = false; tokens[i].finished = false;
+  }
+  for (int p = 0; p < totalPlayers; p++) {
+    int player = playerOrder[p];
+    for (int t = 0; t < 4; t++) {
+      int idx = (player - 1) * 4 + t;
+      tokens[idx].player = player; tokens[idx].id = t;
+      tokens[idx].pos = -1; tokens[idx].onHome = false; tokens[idx].finished = false;
+    }
+  }
+}
+
+// ─────────────────────────────────────────
+//  slideToken — animates token along main track
+//  from fromPos to toPos (both inclusive as start/end)
+//  stops at pos 50 max — home entry handled by moveToken
+// ─────────────────────────────────────────
+void slideToken(Token &t, int fromPos, int toPos) {
+  uint32_t col = getColor(t.player, t.id);
+  for (int pos = fromPos; pos < toPos; pos++) {
+    int currLED = posToLED(t.player, pos);
+    int nextLED = posToLED(t.player, pos + 1);
+    // nextLED is -1 when pos+1 > 50 (home boundary) — skip, drawBoard handles it
+    if (nextLED >= 0) setLED(nextLED, col);
+    bool occupied = false;
+    for (int i = 0; i < 16; i++) {
+      if (tokens[i].finished || tokens[i].pos < 0 || tokens[i].onHome || &tokens[i] == &t) continue;
+      if (tokenToLED(tokens[i]) == currLED) { occupied = true; break; }
+    }
+    if (!occupied && currLED >= 0) setLED(currLED, 0);
+    showAll(); delay(120);
+  }
+}
+
+// ─────────────────────────────────────────
+//  moveToken
+//
+//  Main track:  pos 0–50  (51 squares)
+//  Home lane:   pos 51–55 (5 steps, 55 = finished)
+//
+//  sth = steps to home entry = 51 - t.pos
+//  homeStep = how many steps into home lane = diceValue - sth
+// ─────────────────────────────────────────
+bool moveToken(int player, int tokenID) {
+  int idx = getTokenIndex(player, tokenID);
+  if (idx < 0 || idx >= 16) return false;
+  Token &t = tokens[idx];
+  if (t.pos == -2 || !canMove(t)) return false;
+
+  // ── Exit base ──
+  if (t.pos == -1) {
+    t.pos = 0; t.onHome = false; tokenJustEntered = true;
+    Serial.printf("P%d T%d entered at pos 0\n", player, tokenID);
+    checkKill(idx); drawBoard(); return true;
+  }
+
+  // ── Move inside home lane ──
+  if (t.onHome) {
+    int from       = t.pos - 51;          // steps already in home (0–4)
+    int to         = from + diceValue;     // new steps in home
+    uint32_t col   = getColor(t.player, t.id);
+    int hs         = HOME_PATH_START[t.player];
+    for (int s = from; s < to; s++) {
+      setLED(hs + s + 1, col);
+      setLED(hs + s,     0);              // always clear previous — no ghost
+      showAll(); delay(120);
+    }
+    t.pos += diceValue;
+    if (t.pos - 51 >= 4) {                // pos 55 = finished (4 steps from first home LED)
+      t.finished = true; drawBoard(); homeCompleteAnimation(player);
+    } else {
+      drawBoard();
+    }
+    return true;
+  }
+
+  // ── Main track ──
+  int sth = 51 - t.pos;                   // steps left to reach home entry
+
+  if (diceValue >= sth) {
+    // Token enters home this move
+    int homeStep = diceValue - sth;        // steps into home lane (1–5)
+    slideToken(t, t.pos, t.pos + sth);    // slide to pos 50 (last main square)
+    t.pos    = 51 + homeStep;             // e.g. dice=sth → pos=51 (first home LED)
+    t.onHome = true;
+    if (homeStep >= 4) {                   // landed on or past last home LED
+      t.finished = true; drawBoard(); homeCompleteAnimation(player);
+    } else {
+      // Animate into home lane from first LED up to homeStep
+      uint32_t col = getColor(t.player, t.id);
+      int hs = HOME_PATH_START[t.player];
+      for (int s = 0; s < homeStep; s++) {
+        setLED(hs + s + 1, col);
+        setLED(hs + s,     0);
+        showAll(); delay(120);
+      }
+      drawBoard();
+    }
+  } else {
+    // Normal main-track move
+    int from = t.pos;
+    slideToken(t, from, from + diceValue);
+    t.pos = from + diceValue;
+    checkKill(idx); drawBoard();
+  }
+  return true;
+}
+
+bool checkWin(int player) {
+  int start = (player - 1) * 4;
+  for (int i = start; i < start + 4; i++) if (!tokens[i].finished) return false;
+  return true;
+}
+
+void nextPlayer() {
+  sixCount = 0;
+  currentPlayerIndex = (currentPlayerIndex + 1) % totalPlayers;
+  currentPlayer = playerOrder[currentPlayerIndex];
+  Serial.printf("Next: P%d\n", currentPlayer);
+}
+
+void sendState(uint8_t event) {
+  outgoingState.type          = 3;
+  outgoingState.currentPlayer = currentPlayer;
+  outgoingState.lastDice      = diceValue;
+  outgoingState.lastToken     = incomingData.token;
+  outgoingState.event         = event;
+  esp_now_send(transmitterMAC, (uint8_t*)&outgoingState, sizeof(outgoingState));
+  Serial.printf("State -> P%d dice:%d event:%d\n", currentPlayer, diceValue, event);
+}
+
+void handleInit(GameData &d) {
+  totalPlayers = 0;
+  for (int i = 0; i < 4; i++) if (d.playerList[i] != 0) playerOrder[totalPlayers++] = d.playerList[i];
+  currentPlayerIndex = 0; currentPlayer = playerOrder[0]; sixCount = 0;
+  waitingForToken = false; killHappened = false; tokenJustEntered = false;
+  for (int i = 0; i < 4; i++) { lastFlickerTime[i] = 0; flickerState[i] = true; }
+  initTokens(); delay(100);
+  gameStartAnimation();
+  gameStarted = true;
+  Serial.print("Game started. Order: ");
+  for (int i = 0; i < totalPlayers; i++) Serial.printf("%d ", playerOrder[i]);
+  Serial.println();
+  queueState(0);
+}
+
+void handleDice(GameData &d) {
+  if (!gameStarted || d.player != currentPlayer) return;
+  diceValue = d.dice;
+  if (diceValue == 6) sixCount++; else sixCount = 0;
+  Serial.printf("Dice: %d\n", diceValue);
+  if (sixCount == 3) { sixCount = 0; nextPlayer(); queueState(3); return; }
+  if (!anyCanMove(currentPlayer)) { nextPlayer(); queueState(2); return; }
+  for (int i = 0; i < 4; i++) { flickerState[i] = true; lastFlickerTime[i] = millis(); }
+  waitingForToken = true; drawBoard(); queueState(7);
+}
+
+void handleMove(GameData &d) {
+  if (!gameStarted || !waitingForToken || d.player != currentPlayer) return;
+
+  int idx = getTokenIndex(d.player, d.token);
+  if (idx < 0 || idx >= 16) { waitingForToken = true; drawBoard(); queueState(7); return; }
+
+  if (!canMove(tokens[idx])) {
+    if (anyCanMove(d.player)) {
+      Serial.printf("T%d invalid but others can move — re-prompting\n", d.token);
+      waitingForToken = true; drawBoard(); queueState(7);
+    } else {
+      nextPlayer(); queueState(2);
+    }
+    return;
+  }
+
+  waitingForToken = false; killHappened = false; tokenJustEntered = false;
+  bool moved = moveToken(d.player, d.token);
+  if (!moved) { waitingForToken = true; drawBoard(); queueState(7); return; }
+
+  int movedIdx = getTokenIndex(d.player, d.token);
+  if (movedIdx < 0 || movedIdx >= 16) { nextPlayer(); queueState(0); return; }
+  if (checkWin(d.player))             { winAnimation(d.player); queueState(6); gameStarted = false; return; }
+  if (tokens[movedIdx].finished)      { queueState(5); return; }
+  if (tokenJustEntered)               { queueState(killHappened ? 1 : 4); return; }
+  if (diceValue != 6) nextPlayer();
+  queueState(killHappened ? 1 : 0);
+}
+
+volatile bool newDataFlag = false;
+GameData dataBuffer;
+
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  memcpy(&dataBuffer, data, sizeof(dataBuffer));
+  newDataFlag = true;
+}
+
+void lightBases() {
+  base1.setPixelColor(0, base1.Color(46, 204, 113));
+  base1.setPixelColor(1, base1.Color(46, 204, 113));
+  base1.setPixelColor(2, base1.Color(46, 204, 113));
+  base1.setPixelColor(3, base1.Color(46, 204, 113));
+  base1.show();
+  base2.setPixelColor(0, base2.Color(242, 208, 0));
+  base2.setPixelColor(1, base2.Color(242, 208, 0));
+  base2.setPixelColor(2, base2.Color(242, 208, 0));
+  base2.setPixelColor(3, base2.Color(242, 208, 0));
+  base2.show();
+  base3.setPixelColor(0, base3.Color(224, 32, 32));
+  base3.setPixelColor(1, base3.Color(224, 32, 32));
+  base3.setPixelColor(2, base3.Color(224, 32, 32));
+  base3.setPixelColor(3, base3.Color(224, 32, 32));
+  base3.show();
+  base4.setPixelColor(0, base4.Color(47, 110, 245));
+  base4.setPixelColor(1, base4.Color(47, 110, 245));
+  base4.setPixelColor(2, base4.Color(47, 110, 245));
+  base4.setPixelColor(3, base4.Color(47, 110, 245));
+  base4.show();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  mainStrip.begin(); mainStrip.show();
+  base1.begin(); base1.show();
+  base2.begin(); base2.show();
+  base3.begin(); base3.show();
+  base4.begin(); base4.show();
+
+  colorGreen[0]  = mainStrip.Color(46, 204, 113);
+  colorGreen[1]  = mainStrip.Color(46, 204, 113);
+  colorGreen[2]  = mainStrip.Color(46, 204, 113);
+  colorGreen[3]  = mainStrip.Color(46, 204, 113);
+  colorYellow[0] = mainStrip.Color(242, 208, 0);
+  colorYellow[1] = mainStrip.Color(242, 208, 0);
+  colorYellow[2] = mainStrip.Color(242, 208, 0);
+  colorYellow[3] = mainStrip.Color(242, 208, 0);
+  colorBlue[0]   = mainStrip.Color(47, 110, 245);
+  colorBlue[1]   = mainStrip.Color(47, 110, 245);
+  colorBlue[2]   = mainStrip.Color(47, 110, 245);
+  colorBlue[3]   = mainStrip.Color(47, 110, 245);
+  colorRed[0]    = mainStrip.Color(224, 32, 32);
+  colorRed[1]    = mainStrip.Color(224, 32, 32);
+  colorRed[2]    = mainStrip.Color(224, 32, 32);
+  colorRed[3]    = mainStrip.Color(224, 32, 32);
+
+  for (int i = 0; i < 16; i++) tokens[i].pos = -2;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setChannel(1);
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); return; }
+  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, transmitterMAC, 6);
+  peer.channel = 1; peer.encrypt = false;
+  esp_now_add_peer(&peer);
+
+  Serial.println("Receiver ready");
+  delay(100);
+  lightBases();
+}
+
+void loop() {
+  if (newDataFlag) {
+    newDataFlag = false;
+    memcpy(&incomingData, &dataBuffer, sizeof(dataBuffer));
+    switch (incomingData.type) {
+      case 2: handleInit(incomingData); break;
+      case 0: handleDice(incomingData); break;
+      case 1: handleMove(incomingData); break;
+    }
+  }
+
+  if (pendingState && millis() >= pendingSendAt) {
+    pendingState = false;
+    sendState(pendingEvent);
+    delay(10);
+    drawBoard();
+  }
+
+  if (gameStarted) {
+    updateFlicker();
+    static unsigned long lastRefresh = 0;
+    if (millis() - lastRefresh > 200) {
+      lastRefresh = millis();
+      drawBoard();
+    }
+  }
+}
